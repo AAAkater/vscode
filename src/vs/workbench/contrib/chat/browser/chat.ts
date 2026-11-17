@@ -127,6 +127,12 @@ export interface IChatWidgetService {
 	 */
 	revealWidget(preserveFocus?: boolean): Promise<IChatWidget | undefined>;
 
+	/**
+	 * Shows the host of the Chat view's chats ({@link IChatViewHostService}): the Chat view, or what replaces it. Resolves to the
+	 * widget of the chat it shows.
+	 */
+	revealChatView(preserveFocus?: boolean): Promise<IChatWidget | undefined>;
+
 	getAllWidgets(): ReadonlyArray<IChatWidget>;
 	getWidgetByInputUri(uri: URI): IChatWidget | undefined;
 	/** Opens or reveals a session, retaining its model while moving it between widgets. */
@@ -468,6 +474,8 @@ export interface IChatAcceptInputOptions {
 export interface IChatWidgetViewModelChangeEvent {
 	readonly previousSessionResource: URI | undefined;
 	readonly currentSessionResource: URI | undefined;
+	/** Whether the widget shows the session that its first request made of the one it showed, such as a new chat's. */
+	readonly committed?: boolean;
 }
 
 /**
