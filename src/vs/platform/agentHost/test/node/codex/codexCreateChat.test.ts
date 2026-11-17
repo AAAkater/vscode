@@ -60,6 +60,7 @@ import { IAgentSdkDownloader } from '../../../node/agentSdkDownloader.js';
 import { CodexAgent, toCodexModelSelectionId } from '../../../node/codex/codexAgent.js';
 import { CodexAppServerClient, type ICodexAppServerTransport } from '../../../node/codex/codexAppServerClient.js';
 import { CodexTurnDiffTracker } from '../../../node/codex/codexTurnDiffTracker.js';
+import { mapAgentMessageDelta, mapCommandExecutionOutputDelta } from '../../../node/codex/codexMapAppServerEvents.js';
 import { ICodexProxyService } from '../../../node/codex/codexProxyService.js';
 import type { HookMetadata } from '../../../node/codex/protocol/generated/v2/HookMetadata.js';
 import type { CommandExecutionApprovalDecision } from '../../../node/codex/protocol/generated/v2/CommandExecutionApprovalDecision.js';
@@ -3077,7 +3078,7 @@ suite('CodexAgent exact chat routing', () => {
 			for (const state of children) {
 				tracker.start(`${state}-thread`, `${state}-turn`, 'host-turn');
 				const child = agent['_createSubagentSession'](entry, `${state}-thread`);
-				agent['_subagentsByThreadId'].set(`${state}-thread`, { parentSessionId: entry.sessionId, toolCallId: `spawn-${state}`, hostTurnId: 'host-turn', session: child });
+				agent['_subagentsByThreadId'].set(`${state}-thread`, { parentSessionId: entry.sessionId, toolCallId: `spawn-${state}`, hostTurnId: 'host-turn', active: true, handledUserMessageIds: new Set(), openToolCallIds: new Set(), pendingEvents: [], session: child });
 				if (state === 'waiting') {
 					void child.pendingCommandApprovals.register('approval').then(answer => answers.push(answer));
 				}
@@ -3152,7 +3153,7 @@ suite('CodexAgent exact chat routing', () => {
 		tracker.start('waiting-thread', 'waiting-turn', 'later-host');
 		tracker.update({ threadId: 'waiting-thread', turnId: 'waiting-turn', diff: sharedDiff });
 		const child = agent['_createSubagentSession'](entry, 'waiting-thread');
-		agent['_subagentsByThreadId'].set('waiting-thread', { parentSessionId: entry.sessionId, toolCallId: 'spawn-waiting', hostTurnId: 'later-host', session: child });
+		agent['_subagentsByThreadId'].set('waiting-thread', { parentSessionId: entry.sessionId, toolCallId: 'spawn-waiting', hostTurnId: 'later-host', active: true, handledUserMessageIds: new Set(), openToolCallIds: new Set(), pendingEvents: [], session: child });
 		void child.pendingCommandApprovals.register('approval');
 		const release = async () => {
 			const canRelease = await agent.chats.canReleaseChat!(chat, context);
@@ -5797,6 +5798,198 @@ suite('CodexAgent early subagent events', () => {
 		assert.deepStrictEqual(stored, [['app-turn', 'reused-child-turn']]);
 	});
 
+	type ChildTurnStatus = 'inProgress' | 'completed';
+	type ChildTurnItem =
+		| { readonly type: 'userMessage'; readonly id: string; readonly clientId: string | null; readonly text: string }
+		| { readonly type: 'commandExecution'; readonly id: string; readonly command: string; readonly status: 'inProgress' | 'completed'; readonly output: string | null }
+		| { readonly type: 'agentMessage'; readonly id: string; readonly text: string };
+
+	async function startChildHarness(id: string) {
+		const harness = await startParentTurn(id);
+		const childThreadId = `${id}-thread`;
+		const connection = harness.agent['_connection'];
+		assert.ok(connection.kind === 'ready');
+		for (const [method, mapper] of [
+			['item/agentMessage/delta', mapAgentMessageDelta],
+			['item/commandExecution/outputDelta', mapCommandExecutionOutputDelta],
+		] as const) {
+			harness.peer.disposables.add(connection.client.onNotification(method, params => harness.agent['_dispatchByThread'](params.threadId, session => mapper(session.mapState, params))));
+		}
+		const signals: AgentSignal[] = [];
+		disposables.add(harness.agent.onDidChatProgress(signal => signals.push(signal)));
+		const push = (...notifications: { readonly method: string; readonly params: object }[]): void => {
+			for (const notification of notifications) {
+				harness.peer.push(notification);
+			}
+		};
+		const childTurn = (turnId: string, items: readonly ChildTurnItem[], status: ChildTurnStatus) => ({
+			id: turnId,
+			rootTurnId: null,
+			items: items.map(item => item.type === 'userMessage'
+				? { type: item.type, id: item.id, clientId: item.clientId, content: [{ type: 'text', text: item.text, text_elements: [] }] }
+				: item.type === 'commandExecution'
+					? { type: item.type, id: item.id, pluginId: null, scriptPath: null, command: item.command, cwd: harness.folder.fsPath, processId: null, source: 'agent', status: item.status, commandActions: [], aggregatedOutput: item.output, exitCode: item.status === 'completed' ? 0 : null, durationMs: item.status === 'completed' ? 1 : null }
+					: { type: item.type, id: item.id, text: item.text, phase: null, memoryCitation: null, delivery: null, questions: null }),
+			itemsView: 'full',
+			status,
+			error: null,
+			startedAt: 1,
+			completedAt: status === 'completed' ? 2 : null,
+			durationMs: status === 'completed' ? 1000 : null,
+		});
+		const startTurn = (turnId: string, items: readonly ChildTurnItem[] = []) => push({ method: 'turn/started', params: { threadId: childThreadId, turn: childTurn(turnId, items, 'inProgress') } });
+		const completeTurn = (turnId: string, items: readonly ChildTurnItem[] = []) => push({ method: 'turn/completed', params: { threadId: childThreadId, turn: childTurn(turnId, items, 'completed') } });
+		const startItem = (turnId: string, item: ChildTurnItem) => push({ method: 'item/started', params: { threadId: childThreadId, turnId, startedAtMs: 0, item: childTurn(turnId, [item], 'inProgress').items[0] } });
+		const completeItem = (turnId: string, item: ChildTurnItem) => push({ method: 'item/completed', params: { threadId: childThreadId, turnId, completedAtMs: 0, item: childTurn('completed-' + turnId, [item], 'completed').items[0] } });
+		const user = (id: string, text: string): ChildTurnItem => ({ type: 'userMessage', id, clientId: null, text });
+		const answer = (id: string, text: string): ChildTurnItem => ({ type: 'agentMessage', id, text });
+		const command = (id: string, status: 'inProgress' | 'completed', output: string | null = null): ChildTurnItem => ({ type: 'commandExecution', id, command: 'printf follow-up', status, output });
+		return {
+			...harness, childThreadId, signals, push, startTurn, completeTurn, startItem, completeItem, user, answer, command,
+			sendInput: (prompt: string) => {
+				const item = { type: 'collabAgentToolCall', id: `send-input-${prompt}`, tool: 'sendInput', status: 'inProgress', senderThreadId: harness.threadId, receiverThreadIds: [childThreadId], prompt, model: null, reasoningEffort: null, agentsStates: {} };
+				push(
+					{ method: 'item/started', params: { threadId: harness.threadId, turnId: 'app-turn', startedAtMs: 0, item } },
+					{ method: 'item/completed', params: { threadId: harness.threadId, turnId: 'app-turn', completedAtMs: 0, item: { ...item, status: 'completed' } } },
+				);
+			},
+		};
+	}
+
+	async function spawnCompletedChild(id: string) {
+		const harness = await startChildHarness(id);
+		harness.spawn('spawn', 'inProgress');
+		harness.spawn('spawn', 'completed', harness.childThreadId);
+		harness.startTurn('child-turn-1', [harness.user('child-turn-1-user', 'Edit the file')]);
+		harness.completeTurn('child-turn-1', [harness.user('child-turn-1-user', 'Edit the file')]);
+		await timeout(0);
+		const started = harness.signals.find((signal): signal is Extract<AgentSignal, { kind: 'subagent_started' }> => signal.kind === 'subagent_started');
+		assert.ok(started);
+		return { ...harness, started };
+	}
+
+	test('completed child resumes the original chat for a later user message', async () => {
+		const harness = await spawnCompletedChild('resumed-child-chat');
+		harness.sendInput('Follow up');
+		harness.startTurn('child-turn-2');
+		await timeout(0);
+		const resumedBeforeDelivery = harness.signals.filter(signal => signal.kind === 'subagent_resumed').length;
+		harness.startItem('child-turn-2', harness.user('child-turn-2-user', 'Follow up'));
+		harness.startItem('child-turn-2', harness.command('followup-tool', 'inProgress'));
+		harness.completeItem('child-turn-2', harness.command('followup-tool', 'completed', 'tool result'));
+		harness.startItem('child-turn-2', harness.answer('followup-answer', ''));
+		harness.push({ method: 'item/agentMessage/delta', params: { threadId: harness.childThreadId, turnId: 'child-turn-2', itemId: 'followup-answer', delta: 'Follow-up answer' } });
+		await timeout(0);
+
+		assert.deepStrictEqual({
+			resumedBeforeDelivery,
+			childActions: harness.signals.flatMap(signal => signal.kind === 'action' && signal.parentToolCallId !== undefined ? [{ type: signal.action.type, toolCallId: signal.parentToolCallId }] : []),
+			spawns: harness.signals.filter(signal => signal.kind === 'subagent_started').length,
+			completed: harness.signals.filter(signal => signal.kind === 'subagent_completed').length,
+			resumed: harness.signals.filter(signal => signal.kind === 'subagent_resumed').map(signal => signal.kind === 'subagent_resumed' ? { toolCallId: signal.toolCallId, message: signal.message } : undefined),
+		}, {
+			resumedBeforeDelivery: 0,
+			childActions: [ActionType.ChatToolCallStart, ActionType.ChatToolCallDelta, ActionType.ChatToolCallReady, ActionType.ChatToolCallComplete, ActionType.ChatResponsePart, ActionType.ChatDelta].map(type => ({ type, toolCallId: harness.started.toolCallId })),
+			spawns: 1,
+			completed: 1,
+			resumed: [{ toolCallId: harness.started.toolCallId, message: { text: 'Follow up', origin: { kind: MessageKind.User } } }],
+		});
+	});
+
+	test('deduplicates the seed echo by item id and preserves later identical follow-ups', async () => {
+		const harness = await startChildHarness('identical-child-followup');
+		const seed = harness.user('child-turn-1-user', 'Edit the file');
+		harness.spawn('spawn', 'inProgress');
+		harness.spawn('spawn', 'completed', harness.childThreadId);
+		harness.startTurn('child-turn-1', [seed]);
+		harness.startItem('child-turn-1', seed);
+		harness.completeTurn('child-turn-1', [seed]);
+		await timeout(0);
+
+		harness.sendInput('Edit the file');
+		harness.startTurn('child-turn-2', [harness.user('same-text-followup-1', 'Edit the file')]);
+		harness.startItem('child-turn-2', harness.user('same-text-followup-1', 'Edit the file'));
+		harness.completeTurn('child-turn-2');
+		await timeout(0);
+
+		harness.sendInput('Edit the file');
+		harness.startTurn('child-turn-3', [harness.user('same-text-followup-2', 'Edit the file')]);
+		harness.startItem('child-turn-3', harness.user('same-text-followup-2', 'Edit the file'));
+		await timeout(0);
+
+		assert.deepStrictEqual(harness.signals.filter(signal => signal.kind === 'subagent_resumed').map(signal => signal.kind === 'subagent_resumed' ? signal.message?.text : undefined), ['Edit the file', 'Edit the file']);
+	});
+
+	test('resumes only after an old command result while a follow-up is pending', async () => {
+		const harness = await spawnCompletedChild('old-tool-followup');
+		const command = harness.command('old-command', 'inProgress');
+		harness.startTurn('child-turn-2', [harness.user('child-turn-2-user', 'First follow-up')]);
+		harness.startItem('child-turn-2', harness.user('child-turn-2-user', 'First follow-up'));
+		harness.startItem('child-turn-2', command);
+		harness.sendInput('Second follow-up');
+		const followup = harness.user('child-turn-2-user-2', 'Second follow-up');
+		harness.startItem('child-turn-2', followup);
+		harness.startItem('child-turn-2', followup);
+		harness.push({ method: 'item/commandExecution/outputDelta', params: { threadId: harness.childThreadId, turnId: 'child-turn-2', itemId: 'old-command', delta: 'old output' } });
+		harness.startItem('child-turn-2', harness.answer('new-answer', ''));
+		harness.push({ method: 'item/agentMessage/delta', params: { threadId: harness.childThreadId, turnId: 'child-turn-2', itemId: 'new-answer', delta: 'new answer' } });
+		await timeout(0);
+
+		const beforeResult = {
+			resumed: harness.signals.filter(signal => signal.kind === 'subagent_resumed').length,
+			completed: harness.signals.filter(signal => signal.kind === 'subagent_completed').length,
+			toolResult: harness.signals.some(signal => signal.kind === 'action' && signal.parentToolCallId !== undefined && signal.action.type === ActionType.ChatToolCallComplete),
+			answerActions: harness.signals.flatMap(signal => signal.kind === 'action' && signal.parentToolCallId !== undefined && (signal.action.type === ActionType.ChatResponsePart || signal.action.type === ActionType.ChatDelta) ? [signal.action.type] : []),
+		};
+		harness.completeItem('child-turn-2', harness.command('old-command', 'completed', 'old output'));
+		await timeout(0);
+		const resumedIndex = harness.signals.findLastIndex(signal => signal.kind === 'subagent_resumed');
+		const resultIndex = harness.signals.findIndex(signal => signal.kind === 'action' && signal.parentToolCallId !== undefined && signal.action.type === ActionType.ChatToolCallComplete);
+		const answerActions = harness.signals.flatMap(signal => signal.kind === 'action' && signal.parentToolCallId !== undefined && (signal.action.type === ActionType.ChatResponsePart || signal.action.type === ActionType.ChatDelta) ? [{ type: signal.action.type, turnId: signal.action.turnId }] : []);
+		const resumedMessages = harness.signals.flatMap(signal => signal.kind === 'subagent_resumed' ? [signal.message?.text] : []);
+		assert.deepStrictEqual({ beforeResult, resumedAfterResult: resumedIndex > resultIndex, resumedMessages, answerActions }, {
+			beforeResult: { resumed: 1, completed: 1, toolResult: false, answerActions: [] },
+			resumedAfterResult: true,
+			resumedMessages: ['First follow-up', 'Second follow-up'],
+			answerActions: [
+				{ type: ActionType.ChatResponsePart, turnId: 'child-turn-2' },
+				{ type: ActionType.ChatDelta, turnId: 'child-turn-2' },
+			],
+		});
+	});
+
+	test('drains multiple follow-ups without moving a buffered tool into the next turn', async () => {
+		const harness = await spawnCompletedChild('multiple-child-followups');
+		harness.startTurn('child-turn-2', [harness.user('first', 'First follow-up')]);
+		harness.startItem('child-turn-2', harness.command('first-tool', 'inProgress'));
+		harness.startItem('child-turn-2', harness.user('second', 'Second follow-up'));
+		harness.startItem('child-turn-2', harness.command('second-tool', 'inProgress'));
+		harness.startItem('child-turn-2', harness.user('third', 'Third follow-up'));
+		harness.completeItem('child-turn-2', harness.command('second-tool', 'completed', 'second result'));
+		harness.completeItem('child-turn-2', harness.command('first-tool', 'completed', 'first result'));
+		harness.completeTurn('child-turn-2');
+		await timeout(0);
+		assert.deepStrictEqual(harness.signals.flatMap(signal => {
+			if (signal.kind === 'subagent_resumed') {
+				return [signal.message!.text];
+			}
+			if (signal.kind === 'action' && signal.parentToolCallId !== undefined && signal.action.type === ActionType.ChatToolCallComplete) {
+				return [signal.action.result.content?.map(content => content.type === 'text' ? content.text : '').join('') ?? ''];
+			}
+			return [];
+		}), ['First follow-up', 'first result', 'Second follow-up', 'second result', 'Third follow-up']);
+	});
+
+	test('attributes a reused child turn to the parent turn that sent it more work', async () => {
+		const harness = await spawnCompletedChild('reused-child-diff-owner');
+		const parent = [...harness.agent['_sessions'].values()].find(session => session.threadId === harness.threadId)!;
+		parent.hostTurnIdByAppTurnId.set('app-turn', 'followup-parent-turn');
+		harness.sendInput('Follow up');
+		harness.startTurn('child-turn-2', [harness.user('child-turn-2-user', 'Follow up')]);
+		await timeout(0);
+		assert.deepStrictEqual(harness.agent['_turnDiffs'].get(parent)!['_nativeTurns'].get('child-turn-2')?.hostTurnId, 'followup-parent-turn');
+	});
+
 	test('disposing the session settles spawns its children started', async () => {
 		const harness = await startParentTurn('disposed-spawner');
 		harness.spawn('spawn', 'inProgress');
@@ -5815,6 +6008,6 @@ suite('CodexAgent early subagent events', () => {
 		})();
 		await disposing;
 		await answering;
-		assert.deepStrictEqual([...harness.agent['_spawnsInFlight'].keys()], []);
+		assert.deepStrictEqual({ spawns: [...harness.agent['_spawnsInFlight'].keys()], children: [...harness.agent['_subagentsByThreadId'].keys()] }, { spawns: [], children: [] });
 	});
 });

@@ -47,7 +47,7 @@ import { ActionType, isChatAction, type SessionAction, type ChatAction } from '.
 import { parseLeadingSlashCommand } from '../../common/agentHostSlashCommand.js';
 import type { ConfigSchema, ModelSelection, ProtectedResourceMetadata, ToolDefinition, AgentSelection } from '../../common/state/protocol/state.js';
 import type { ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../../common/state/protocol/commands.js';
-import { createErrorResponsePart, withSessionWorkspaceless, CustomizationType, type ClientPluginCustomization, type DirectoryCustomization, type ISessionFolderPickerDecision, type McpServerCustomization, type MessageAttachment, type PendingMessage, type ChatInputAnswer, ChatInputResponseKind, type PluginCustomization, type PolicyState, type ToolCallResult, type ToolResultContent, ToolResultContentType, type Turn, ResponsePartKind } from '../../common/state/sessionState.js';
+import { createErrorResponsePart, withSessionWorkspaceless, CustomizationType, type ClientPluginCustomization, type DirectoryCustomization, type ISessionFolderPickerDecision, type McpServerCustomization, type MessageAttachment, MessageKind, type PendingMessage, type ChatInputAnswer, ChatInputResponseKind, type PluginCustomization, type PolicyState, type ToolCallResult, type ToolResultContent, ToolResultContentType, type Turn, ResponsePartKind } from '../../common/state/sessionState.js';
 import { deriveLegacyDefaultChat } from '../../common/agentHostLegacyDefaultChat.js';
 import type { IAgentServerToolHost } from '../../common/agentServerTools.js';
 import { ActiveClientToolSet } from '../activeClientState.js';
@@ -940,8 +940,18 @@ interface ICodexSubagent {
 	readonly parentSessionId: string;
 	/** Host-side toolCallId of the parent `spawnAgent` collab tool call (routing key). */
 	readonly toolCallId: string;
-	/** The host turn that spawned the child, retained across parent cancellation and replacement sends. */
-	readonly hostTurnId: string;
+	/** The parent host turn that most recently gave the child work; later reuse refreshes it. */
+	hostTurnId: string;
+	/** Whether the child currently has a visible conversation turn. */
+	active: boolean;
+	/** The opening prompt is already shown by subagent_started; consume its echo once. */
+	seedPrompt?: string;
+	/** Deduplicates the opening items in turn/started against their item/started echoes. */
+	readonly handledUserMessageIds: Set<string>;
+	/** Host tool-call ids whose starts have been published in the current visible turn. */
+	readonly openToolCallIds: Set<string>;
+	/** Follow-up boundaries and their progress, held until preceding tools report their real results. */
+	readonly pendingEvents: ({ readonly kind: 'message'; readonly text: string } | { readonly kind: 'action'; readonly action: SessionAction | ChatAction })[];
 	/**
 	 * Isolated session used to run the shared event mappers for the child
 	 * thread. Shares the parent's `sessionUri` and `acceptedForSession` memo so
@@ -1215,7 +1225,9 @@ export class CodexAgent extends Disposable implements IAgent {
 	 * thread id. Populated when a parent session's `spawnAgent` collab tool
 	 * call completes (carrying the child `receiverThreadIds`); the child's
 	 * subsequent `turn/*` and `item/*` notifications route here instead of
-	 * {@link _sessionIdByThreadId}. Removed on the child's `turn/completed`.
+	 * {@link _sessionIdByThreadId}. Retained across child turns so a reused
+	 * native thread keeps the same child conversation, and removed with its
+	 * parent runtime or connection.
 	 */
 	private readonly _subagentsByThreadId = new Map<string, ICodexSubagent>();
 	/**
@@ -3253,15 +3265,21 @@ export class CodexAgent extends Disposable implements IAgent {
 		// The workbench already dispatched the canonical turn start before sendMessage.
 		// Codex's event only establishes app-server turn id correlation for later items.
 		const appTurnId = params.turn.id;
+		const subagent = this._subagentsByThreadId.get(params.threadId);
 		session.hostTurnIdByAppTurnId.set(appTurnId, session.currentTurnId ?? this._hostTurnId(session, appTurnId));
 		session.currentAppTurnId = appTurnId;
+		if (subagent) {
+			const prompt = params.turn.items.find(item => item.type === 'userMessage');
+			if (prompt?.type === 'userMessage') {
+				this._queueSubagentUserMessage(subagent, prompt.id, extractUserInputText(prompt.content));
+			}
+		}
 		if (session.pendingTurnPermissions) {
 			session.turnPermissions = { turnId: appTurnId, applied: session.pendingTurnPermissions, updates: new Sequencer() };
 			session.pendingTurnPermissions = undefined;
 		}
 		this._updateTurnReviewer(session);
 		const mapped = this._withHostTurn(session, params);
-		const subagent = this._subagentsByThreadId.get(params.threadId);
 		const owner = this._turnDiffOwner(session);
 		if (owner) {
 			this._getTurnDiffTracker(owner).start(params.threadId, appTurnId, subagent?.hostTurnId ?? mapped.turn.id);
@@ -3323,6 +3341,10 @@ export class CodexAgent extends Disposable implements IAgent {
 			const owner = this._childTurnDiffOwners.get(threadId);
 			if (owner) {
 				owner.hostTurnId = hostTurnId;
+			}
+			const subagent = this._subagentsByThreadId.get(threadId);
+			if (subagent) {
+				subagent.hostTurnId = hostTurnId;
 			}
 		}
 	}
@@ -3449,7 +3471,7 @@ export class CodexAgent extends Disposable implements IAgent {
 	private _handleItemStarted(session: ICodexSession, params: ItemStartedNotification): (SessionAction | ChatAction)[] {
 		this._bindReusedChildren(session, params);
 		if (params.item.type === 'userMessage') {
-			return this._handleSteeredUserMessage(session, params.item.content, params.item.clientId);
+			return this._handleUserMessage(session, params.item.id, params.item.content, params.item.clientId);
 		}
 		if (params.item.type === 'collabAgentToolCall' && params.item.tool === 'spawnAgent') {
 			this._spawnsInFlight.set(`${params.threadId}/${params.item.id}`, session);
@@ -3460,17 +3482,87 @@ export class CodexAgent extends Disposable implements IAgent {
 	/**
 	 * Codex echoes every user message — the turn opener (already shown by
 	 * the workbench before `sendMessage`) and any steered input — as a
-	 * `userMessage` item. Only steered input is buffered in
-	 * {@link ICodexSession.pendingSteeringFlips}; a buffered match is
-	 * promoted into its own visible turn and everything else is dropped.
+	 * `userMessage` item. Root steered input is buffered in
+	 * {@link ICodexSession.pendingSteeringFlips}; a child's opening echo is
+	 * already represented by its lifecycle signal, while later echoes resume
+	 * the same visible child turn or open its next one.
 	 */
-	private _handleSteeredUserMessage(session: ICodexSession, content: readonly UserInput[], clientId: string | null): (SessionAction | ChatAction)[] {
+	private _handleUserMessage(session: ICodexSession, itemId: string, content: readonly UserInput[], clientId: string | null): (SessionAction | ChatAction)[] {
 		const text = extractUserInputText(content);
 		const steering = this._takeMatchingPendingSteering(session, text, clientId);
-		if (!steering) {
-			return [];
+		if (steering) {
+			return this._beginSteeringTurn(session, steering);
 		}
-		return this._beginSteeringTurn(session, steering);
+		const subagent = session.threadId ? this._subagentsByThreadId.get(session.threadId) : undefined;
+		if (subagent) {
+			this._queueSubagentUserMessage(subagent, itemId, text);
+		}
+		return [];
+	}
+
+	/** Native user-message delivery, rather than the parent's send tool, starts a visible child turn. */
+	private _queueSubagentUserMessage(subagent: ICodexSubagent, itemId: string, text: string): void {
+		if (subagent.handledUserMessageIds.has(itemId)) {
+			return;
+		}
+		subagent.handledUserMessageIds.add(itemId);
+		const seedPrompt = subagent.seedPrompt;
+		subagent.seedPrompt = undefined;
+		if (seedPrompt !== undefined && seedPrompt === text) {
+			return;
+		}
+		subagent.pendingEvents.push({ kind: 'message', text });
+		this._flushSubagentEvents(subagent);
+	}
+
+	private _fireSubagentActions(subagent: ICodexSubagent, actions: readonly (SessionAction | ChatAction)[]): void {
+		for (const action of actions) {
+			this._fireSubagent(subagent, action);
+		}
+	}
+
+	/** Keep old tool results in their owning turn before publishing a follow-up and its response. */
+	private _flushSubagentEvents(subagent: ICodexSubagent): void {
+		const events = subagent.pendingEvents;
+		while (events.length > 0) {
+			if (events[0].kind === 'message' && subagent.openToolCallIds.size > 0) {
+				// A result may already be buffered behind another message whose tools only
+				// became visible during this drain. Publish that tool's progress first.
+				const index = events.findIndex(event => event.kind === 'action'
+					&& hasKey(event.action, { toolCallId: true }) && subagent.openToolCallIds.has(event.action.toolCallId));
+				if (index < 0) {
+					return;
+				}
+				const [event] = events.splice(index, 1);
+				if (event.kind === 'action') {
+					this._emitSubagentAction(subagent, event.action);
+				}
+				continue;
+			}
+			const event = events.shift()!;
+			if (event.kind === 'action') {
+				this._emitSubagentAction(subagent, event.action);
+				continue;
+			}
+			if (subagent.active) {
+				this._emitSubagentCompleted(subagent);
+			}
+			subagent.active = true;
+			this._emitChatProgress(this._sessions.get(subagent.parentSessionId), {
+				kind: 'subagent_resumed',
+				chat: subagent.session.chatChannel!,
+				toolCallId: subagent.toolCallId,
+				message: { text: event.text, origin: { kind: MessageKind.User } },
+			});
+		}
+	}
+
+	private _emitSubagentCompleted(subagent: ICodexSubagent): void {
+		this._emitChatProgress(this._sessions.get(subagent.parentSessionId), {
+			kind: 'subagent_completed',
+			chat: subagent.session.chatChannel!,
+			toolCallId: subagent.toolCallId,
+		});
 	}
 
 	/**
@@ -3823,9 +3915,7 @@ export class CodexAgent extends Disposable implements IAgent {
 		const subagent = this._subagentsByThreadId.get(threadId);
 		if (subagent) {
 			const actions = mapFn(subagent.session);
-			for (const action of actions) {
-				this._fireSubagent(subagent, action);
-			}
+			this._fireSubagentActions(subagent, actions);
 			return;
 		}
 		const sessionId = this._sessionIdByThreadId.get(threadId);
@@ -3906,9 +3996,7 @@ export class CodexAgent extends Disposable implements IAgent {
 		const subagent = this._subagentsByThreadId.get(params.threadId);
 		if (subagent) {
 			const mapped = this._withHostTurnId(subagent.session, params);
-			for (const action of mapTokenUsageUpdated(subagent.session.mapState, mapped, subagent.session.model?.id)) {
-				this._fireSubagent(subagent, action);
-			}
+			this._fireSubagentActions(subagent, mapTokenUsageUpdated(subagent.session.mapState, mapped, subagent.session.model?.id));
 			const modelCall = mapTokenUsageModelCallCompleted(mapped, subagent.session.chatChannel!);
 			if (subagent.session.lastModelCallUsageId !== modelCall.modelCallId) {
 				subagent.session.lastModelCallUsageId = modelCall.modelCallId;
@@ -3952,10 +4040,9 @@ export class CodexAgent extends Disposable implements IAgent {
 		const subagent = this._subagentsByThreadId.get(params.threadId);
 		if (subagent) {
 			this._recordTurnFileChanges(subagent.session, params);
-			const actions = mapItemCompleted(subagent.session.mapState, this._withHostTurnId(subagent.session, params));
-			for (const action of actions) {
-				this._fireSubagent(subagent, action);
-			}
+			const mapped = this._withHostTurnId(subagent.session, params);
+			const actions = mapItemCompleted(subagent.session.mapState, mapped);
+			this._fireSubagentActions(subagent, actions);
 			this._settleSpawnItem(params);
 			return;
 		}
@@ -4056,8 +4143,8 @@ export class CodexAgent extends Disposable implements IAgent {
 	 * flush/orphan actions to the child conversation but suppress its
 	 * `ChatTurnComplete` — the child conversation's turn is closed cleanly
 	 * (without the parent's checkpoint/changeset/title side effects) by the
-	 * `subagent_completed` signal, which also tears down the child-thread
-	 * tracking.
+	 * `subagent_completed` signal. Its thread route remains available for
+	 * subsequent turns of the same child.
 	 */
 	private _dispatchTurnCompleted(params: TurnCompletedNotification): void {
 		const subagent = this._subagentsByThreadId.get(params.threadId);
@@ -4073,19 +4160,12 @@ export class CodexAgent extends Disposable implements IAgent {
 				this._stageTurnDiff(subagent.session, params.turn.id, parent);
 			}
 			const actions = this._handleTurnCompletedNotification(subagent.session, params, false);
-			for (const action of actions) {
-				if (action.type === ActionType.ChatTurnComplete) {
-					continue;
-				}
-				this._fireSubagent(subagent, action);
-			}
-			this._subagentsByThreadId.delete(params.threadId);
+			this._fireSubagentActions(subagent, actions.filter(action => action.type !== ActionType.ChatTurnComplete));
 			subagent.session.pendingCommandApprovals.denyAll('decline');
-			this._emitChatProgress(this._sessions.get(subagent.parentSessionId), {
-				kind: 'subagent_completed',
-				chat: subagent.session.chatChannel!,
-				toolCallId: subagent.toolCallId,
-			});
+			this._flushSubagentEvents(subagent);
+			subagent.seedPrompt = undefined;
+			subagent.active = false;
+			this._emitSubagentCompleted(subagent);
 			return;
 		}
 		const detached = this._detachedChildTurnDiffs(params.threadId, params.turn.id);
@@ -4133,6 +4213,11 @@ export class CodexAgent extends Disposable implements IAgent {
 				parentSessionId: session.sessionId,
 				toolCallId: entry.toolCallId,
 				hostTurnId,
+				active: true,
+				seedPrompt: typeof item.prompt === 'string' && item.prompt.length > 0 ? item.prompt : undefined,
+				handledUserMessageIds: new Set(),
+				openToolCallIds: new Set(),
+				pendingEvents: [],
 				session: subSession,
 			});
 			this._emitChatProgress(session, {
@@ -4236,6 +4321,21 @@ export class CodexAgent extends Disposable implements IAgent {
 	 * routes the action into the child's read-only conversation.
 	 */
 	private _fireSubagent(subagent: ICodexSubagent, action: SessionAction | ChatAction): void {
+		const isOldTool = hasKey(action, { toolCallId: true }) && subagent.openToolCallIds.has(action.toolCallId);
+		if (subagent.pendingEvents.length > 0 && !isOldTool) {
+			subagent.pendingEvents.push({ kind: 'action', action });
+		} else {
+			this._emitSubagentAction(subagent, action);
+		}
+		this._flushSubagentEvents(subagent);
+	}
+
+	private _emitSubagentAction(subagent: ICodexSubagent, action: SessionAction | ChatAction): void {
+		if (action.type === ActionType.ChatToolCallStart) {
+			subagent.openToolCallIds.add(action.toolCallId);
+		} else if (action.type === ActionType.ChatToolCallComplete) {
+			subagent.openToolCallIds.delete(action.toolCallId);
+		}
 		this._emitChatProgress(this._sessions.get(subagent.parentSessionId), {
 			kind: 'action',
 			resource: subagent.session.chatChannel!,
@@ -6815,7 +6915,7 @@ export class CodexAgent extends Disposable implements IAgent {
 		const { input } = resolveCodexInput(text, steeringMessage.message.attachments);
 		const threadId = session.threadId;
 		// Buffer so the codex `userMessage` echo can promote this into a
-		// visible turn (see {@link _handleSteeredUserMessage}).
+		// visible turn (see {@link _handleUserMessage}).
 		const steering: ICodexPendingSteering = {
 			pendingMessage: steeringMessage,
 			// Match the text actually sent, including attachment context. Keep the
