@@ -12,7 +12,7 @@ import { toHostSnapshotAttachmentMeta } from '../../../common/meta/agentSnapshot
 import { SessionServerToolName } from '../../../common/serverToolNames.js';
 import { ActionType } from '../../../common/state/sessionActions.js';
 import { createCodexSessionMapState, mapItemCompleted, mapItemStarted } from '../../../node/codex/codexMapAppServerEvents.js';
-import { replayThreadToTurns, type ICodexReplayedCommand } from '../../../node/codex/codexReplayMapper.js';
+import { replayCodexSubagentThreadToTurns, replayThreadToTurns, type ICodexReplayedCommand } from '../../../node/codex/codexReplayMapper.js';
 import type { Thread } from '../../../node/codex/protocol/generated/v2/Thread.js';
 import type { ThreadItem } from '../../../node/codex/protocol/generated/v2/ThreadItem.js';
 import { getTurnError, MessageAttachmentKind, MessageKind, ResponsePartKind, ToolCallStatus, ToolResultContentType, TurnState, type ModelSelection } from '../../../common/state/sessionState.js';
@@ -891,4 +891,261 @@ suite('codexReplayMapper', () => {
 			],
 		});
 	});
+	suite('bounded subagent history segmentation', () => {
+		const user = (id: string, text: string, clientId: string | null = null) => ({
+			type: 'userMessage' as const,
+			id,
+			clientId,
+			content: [{ type: 'text' as const, text, text_elements: [] }],
+		});
+		const answer = (id: string, text: string) => ({
+			type: 'agentMessage' as const,
+			id,
+			text,
+			phase: null,
+			memoryCitation: null,
+			delivery: null,
+			questions: null,
+		});
+		const command = (id: string, commandLine: string, output: string, exitCode = 0) => ({
+			type: 'commandExecution' as const,
+			id,
+			pluginId: null,
+			scriptPath: null,
+			command: commandLine,
+			cwd: '/tmp',
+			processId: null,
+			source: 'agent' as const,
+			status: 'completed' as const,
+			commandActions: [],
+			aggregatedOutput: output,
+			exitCode,
+			durationMs: 1,
+		});
+		const nativeTurn = (id: string, items: ThreadItem[], startedAt: number | null = null) => ({
+			id,
+			rootTurnId: null,
+			items,
+			itemsView: 'full' as const,
+			status: 'completed' as const,
+			error: null,
+			startedAt,
+			completedAt: null,
+			durationMs: null,
+		});
+		const summarize = (turns: ReturnType<typeof replayThreadToTurns>) => turns.map(turn => ({
+			id: turn.id,
+			message: turn.message.text,
+			parts: turn.responseParts.map(part => part.kind === ResponsePartKind.Markdown
+				? { kind: part.kind, content: part.content }
+				: part.kind === ResponsePartKind.ToolCall
+					? { kind: part.kind, id: part.toolCall.toolCallId, name: part.toolCall.toolName, success: part.toolCall.status === ToolCallStatus.Completed ? part.toolCall.success : undefined }
+					: { kind: part.kind }),
+		}));
+
+		test('replays root history without consulting the child segmentation', () => {
+			const thread = {
+				id: 'thr',
+				turns: [
+					nativeTurn('turn-1', [
+						user('prompt-1', 'first'),
+						answer('answer-1', 'first answer'),
+						user('prompt-2', 'second'),
+						answer('answer-2', 'second answer'),
+					]),
+				],
+			} as unknown as Thread;
+			const root = replayThreadToTurns(thread);
+			assert.deepStrictEqual({
+				root: summarize(root),
+				segmented: summarize(replayCodexSubagentThreadToTurns(thread)),
+			}, {
+				root: [{
+					id: 'turn-1',
+					message: 'second',
+					parts: [
+						{ kind: ResponsePartKind.Markdown, content: 'first answer' },
+						{ kind: ResponsePartKind.Markdown, content: '\n\nsecond answer' },
+					],
+				}],
+				segmented: [
+					{ id: 'turn-1', message: 'first', parts: [{ kind: ResponsePartKind.Markdown, content: 'first answer' }] },
+					{ id: 'turn-1/item:8:prompt-2', message: 'second', parts: [{ kind: ResponsePartKind.Markdown, content: 'second answer' }] },
+				],
+			});
+		});
+
+		test('preserves the first native id and uses stable composite ids for later prompts', () => {
+			const thread = {
+				id: 'thr',
+				turns: [nativeTurn('turn-1', [
+					user('prompt-1', 'first'),
+					answer('answer-1', 'first answer'),
+					user('prompt-1:second', 'second'),
+					answer('answer-2', 'second answer'),
+					user('prompt-3', 'third'),
+					command('command-1', 'printf result', 'result'),
+				])],
+			} as unknown as Thread;
+
+			const child = replayCodexSubagentThreadToTurns(thread);
+			const root = replayThreadToTurns(thread);
+			assert.deepStrictEqual({
+				childIds: child.map(turn => turn.id),
+				rootIds: root.map(turn => turn.id),
+				childMessages: child.map(turn => turn.message.text),
+			}, {
+				childIds: ['turn-1', 'turn-1/item:15:prompt-1:second', 'turn-1/item:8:prompt-3'],
+				rootIds: ['turn-1'],
+				childMessages: ['first', 'second', 'third'],
+			});
+		});
+
+		test('does not split on a duplicate item id but keeps equal-text prompts', () => {
+			const thread = {
+				id: 'thr',
+				turns: [nativeTurn('turn-1', [
+					user('prompt-1', 'retry'),
+					user('prompt-1', 'retry'),
+					answer('answer-1', 'first answer'),
+					user('prompt-2', 'retry'),
+					answer('answer-2', 'second answer'),
+				])],
+			} as unknown as Thread;
+			const turns = replayCodexSubagentThreadToTurns(thread);
+
+			assert.deepStrictEqual(turns.map(turn => ({
+				id: turn.id,
+				text: turn.message.text,
+				parts: turn.responseParts.map(part => part.kind === ResponsePartKind.Markdown ? part.content : undefined),
+			})), [
+				{ id: 'turn-1', text: 'retry', parts: ['first answer'] },
+				{ id: 'turn-1/item:8:prompt-2', text: 'retry', parts: ['second answer'] },
+			]);
+		});
+
+		test('keeps progress that precedes the first prompt in a promptless leading segment', () => {
+			const turns = replayCodexSubagentThreadToTurns({
+				id: 'thr',
+				turns: [nativeTurn('turn-1', [
+					answer('answer-1', 'progress before a prompt was delivered'),
+					user('prompt-1', 'prompt'),
+					answer('answer-2', 'answer'),
+				])],
+			} as unknown as Thread);
+
+			assert.deepStrictEqual(turns.map(turn => ({
+				id: turn.id,
+				text: turn.message.text,
+				parts: turn.responseParts.map(part => part.kind === ResponsePartKind.Markdown ? part.content : undefined),
+			})), [
+				{ id: 'turn-1', text: '', parts: ['progress before a prompt was delivered'] },
+				{ id: 'turn-1/item:8:prompt-1', text: 'prompt', parts: ['answer'] },
+			]);
+		});
+
+		test('handles promptless replies and unanswered prompts without inventing a prompt', () => {
+			const thread = {
+				id: 'thr',
+				turns: [nativeTurn('turn-1', [
+					answer('answer-1', 'response to an image-only prompt'),
+					user('prompt-1', ''),
+					answer('answer-2', '',
+					),
+					user('prompt-2', 'unanswered'),
+				])],
+			} as unknown as Thread;
+			const turns = replayCodexSubagentThreadToTurns(thread);
+
+			assert.deepStrictEqual(turns.map(turn => ({
+				id: turn.id,
+				text: turn.message.text,
+				attachments: turn.message.attachments?.length ?? 0,
+				parts: turn.responseParts.map(part => part.kind === ResponsePartKind.Markdown ? part.content : undefined),
+			})), [
+				{ id: 'turn-1', text: '', attachments: 0, parts: ['response to an image-only prompt'] },
+				{ id: 'turn-1/item:8:prompt-2', text: 'unanswered', attachments: 0, parts: [] },
+			]);
+		});
+
+		test('keeps a completed command with its owning prompt, in native order', () => {
+			const thread = {
+				id: 'thr',
+				turns: [nativeTurn('turn-1', [
+					user('prompt-1', 'first'),
+					command('command-1', 'echo first', 'first output'),
+					answer('answer-1', 'first answer'),
+					user('prompt-2', 'second'),
+					command('command-2', 'echo second', 'second output'),
+				])],
+			} as unknown as Thread;
+			const commands: ICodexReplayedCommand[] = [];
+			const turns = replayCodexSubagentThreadToTurns(thread, undefined, undefined, commands);
+
+			assert.deepStrictEqual({
+				turns: summarize(turns),
+				commands: commands.map(({ toolCall, output, exitCode }) => ({ id: toolCall.toolCallId, output, exitCode })),
+			}, {
+				turns: [
+					{
+						id: 'turn-1', message: 'first', parts: [
+							{ kind: ResponsePartKind.ToolCall, id: 'command-1', name: 'shell', success: true },
+							{ kind: ResponsePartKind.Markdown, content: 'first answer' },
+						],
+					},
+					{
+						id: 'turn-1/item:8:prompt-2', message: 'second', parts: [
+							{ kind: ResponsePartKind.ToolCall, id: 'command-2', name: 'shell', success: true },
+						],
+					},
+				],
+				commands: [
+					{ id: 'command-1', output: 'first output', exitCode: 0 },
+					{ id: 'command-2', output: 'second output', exitCode: 0 },
+				],
+			});
+		});
+
+		test('applies model and terminal state to a split native turn', () => {
+			const modelA: ModelSelection = { id: 'codex-model:openai:model-a' };
+			const modelB: ModelSelection = { id: 'codex-model:openai:model-b' };
+			const thread = {
+				id: 'thr',
+				turns: [{
+					...nativeTurn('turn-1', [
+						user('prompt-1', 'first'),
+						user('prompt-2', 'second'),
+					], 1000),
+					status: 'failed' as const,
+					error: { message: 'native failure' },
+					completedAt: 1002,
+					durationMs: 2500,
+				}],
+			} as unknown as Thread;
+			const turns = replayCodexSubagentThreadToTurns(thread, new Map([
+				['turn-1', modelA],
+				['turn-1/item:8:prompt-2', modelB],
+			]));
+
+			assert.deepStrictEqual(turns.map(turn => ({
+				id: turn.id,
+				model: turn.message.model?.id,
+				usage: turn.usage?.model,
+				state: turn.state,
+				error: turn.responseParts.filter(part => part.kind === ResponsePartKind.Error).length,
+				startedAt: turn.startedAt,
+				duration: turn.duration,
+			})), [
+				{
+					id: 'turn-1', model: modelA.id, usage: modelA.id, state: TurnState.Complete, error: 0,
+					startedAt: '1970-01-01T00:16:40.000Z', duration: undefined,
+				},
+				{
+					id: 'turn-1/item:8:prompt-2', model: modelB.id, usage: modelB.id, state: TurnState.Error, error: 1,
+					startedAt: undefined, duration: undefined,
+				},
+			]);
+		});
+	});
+
 });

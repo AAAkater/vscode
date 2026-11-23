@@ -30,8 +30,8 @@ import { ILogService, NullLogService } from '../../../../../platform/log/common/
 import { IProductService } from '../../../../../platform/product/common/productService.js';
 import { ITelemetryService } from '../../../../telemetry/common/telemetry.js';
 import { NullTelemetryService } from '../../../../telemetry/common/telemetryUtils.js';
-import { AgentSession, AgentWorkingDirectoryChangedError, type AgentSignal, type IAgentChatContext, type IAgentCreateChatOptions, type IAgentCreateChatResult, type IAgentMaterializeChatEvent, fixedChatOwnerRef } from '../../../common/agent.js';
-import { buildChatUri, buildDefaultChatUri, MessageAttachmentKind, MessageKind, ResponsePartKind, SessionStatus } from '../../../common/state/sessionState.js';
+import { AgentSession, AgentWorkingDirectoryChangedError, type AgentSignal, type IAgentChatContext, type IAgentCreateChatOptions, type IAgentCreateChatResult, type IAgentMaterializeChatEvent, fixedChatOwnerRef, SubagentChatSignal } from '../../../common/agent.js';
+import { buildChatUri, buildDefaultChatUri, ChatOriginKind, MessageAttachmentKind, MessageKind, ResponsePartKind, SessionStatus, ToolCallStatus, ToolResultContentType } from '../../../common/state/sessionState.js';
 import { ActionType } from '../../../common/state/sessionActions.js';
 import { readUsageInfoMeta } from '../../../common/meta/agentUsageMeta.js';
 import { chatTurnComplete, chatTurnStarted } from '../../common/chatActionBuilders.js';
@@ -5654,9 +5654,9 @@ suite('CodexAgent live approvals', () => {
  * Connects a fresh agent to a test peer and starts native turn `app-turn` on a new chat,
  * routing the turn and item notifications that turn-level tests drive.
  */
-async function startNativeTurn(disposables: Pick<DisposableStore, 'add'>, id: string) {
+async function startNativeTurn(disposables: Pick<DisposableStore, 'add'>, id: string, sessionStore?: ITestSessionStore) {
 	const stateManager = disposables.add(new AgentHostStateManager(new NullLogService()));
-	const agent = await createAgent(disposables, { stateManager });
+	const agent = await createAgent(disposables, { stateManager, sessionStore });
 	const peer = disposables.add(createTestPeer());
 	connectPeer(agent, peer);
 	agent['_refreshMcpInventory'] = async () => { };
@@ -5685,7 +5685,7 @@ async function startNativeTurn(disposables: Pick<DisposableStore, 'add'>, id: st
 	const notifyTurn = (status: 'inProgress' | 'completed') => peer.push({ method: status === 'inProgress' ? 'turn/started' : 'turn/completed', params: { threadId, turn: { id: 'app-turn', items: [], itemsView: 'full', status, error: null, startedAt: 1, completedAt: status === 'completed' ? 2 : null, durationMs: null } } });
 	notifyTurn('inProgress');
 	await timeout(0);
-	return { agent, peer, chat, context, folder, threadId, notifyTurn };
+	return { agent, peer, session, chat, context, folder, threadId, notifyTurn };
 }
 
 suite('CodexAgent late steering', () => {
@@ -5729,8 +5729,8 @@ suite('CodexAgent late steering', () => {
 suite('CodexAgent early subagent events', () => {
 	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
 
-	async function startParentTurn(id: string) {
-		const harness = await startNativeTurn(disposables, id);
+	async function startParentTurn(id: string, sessionStore?: ITestSessionStore) {
+		const harness = await startNativeTurn(disposables, id, sessionStore);
 		const spawn = (itemId: string, status: 'inProgress' | 'completed', child?: string, threadId = harness.threadId) => harness.peer.push({
 			method: status === 'inProgress' ? 'item/started' : 'item/completed',
 			params: {
@@ -5762,6 +5762,60 @@ suite('CodexAgent early subagent events', () => {
 		harness.spawn('spawn', 'completed', 'child-thread');
 		await timeout(0);
 		assert.deepStrictEqual(childActions, [ActionType.ChatToolCallStart, ActionType.ChatToolCallDelta, ActionType.ChatToolCallReady, ActionType.ChatToolCallContentChanged, ActionType.ChatToolCallComplete]);
+	});
+
+	test('restores the original child chat and its separate follow-ups on a fresh agent', async () => {
+		const sessionStore = createTestSessionStore();
+		const live = await startParentTurn('restore-child-followups', sessionStore);
+		const childThreadId = 'restore-child-thread';
+		const spawned = Event.toPromise(Event.filter(live.agent.onDidChatProgress, signal => signal.kind === 'subagent_started'));
+		live.spawn('native-spawn', 'inProgress');
+		live.spawn('native-spawn', 'completed', childThreadId);
+		const spawn = SubagentChatSignal.toSpawnEvent(await spawned, () => ({ owner: live.session.toString(), format: live.context.owner.getSubagentChatUriFormat() }));
+		assert.ok(spawn?.parent);
+		live.notifyTurn('completed');
+		await timeout(0);
+		await live.agent.shutdown();
+
+		const restored = await createAgent(disposables, { sessionStore });
+		const peer = disposables.add(createTestPeer());
+		connectPeer(restored, peer);
+		const parentContext = hostChatContext(live.session, live.chat);
+		await restored.materializeChat(live.chat, parentContext, undefined);
+		const request = (id: string, text: string) => ({ id, type: 'userMessage', content: [{ type: 'text', text, text_elements: [] }] });
+		const reply = (id: string, text: string) => ({ id, type: 'agentMessage', text });
+		const turn = (id: string, items: readonly object[]) => ({ id, items, itemsView: 'full', status: 'completed', error: null, startedAt: 1, completedAt: 2, durationMs: null });
+		async function answerHistory(threadId: string, turns: readonly object[]): Promise<void> {
+			const thread = { id: threadId, cwd: live.folder.fsPath, path: null, source: 'vscode' };
+			const summary = await readNextRequest(peer.outbound);
+			assert.deepStrictEqual([summary.method, summary.params], ['thread/read', { threadId, includeTurns: false }]);
+			peer.push({ id: summary.id, result: { thread } });
+			const history = await readNextRequest(peer.outbound);
+			assert.deepStrictEqual([history.method, history.params], ['thread/read', { threadId, includeTurns: true }]);
+			peer.push({ id: history.id, result: { thread: { ...thread, turns } } });
+		}
+
+		const parentHistory = restored.chats.getMessages(live.chat, parentContext);
+		await answerHistory(live.threadId, [turn('app-turn', [request('parent-input', 'Continue'), reply('parent-reply', 'Delegated')])]);
+		const [parentTurn] = await parentHistory;
+		const childLink = parentTurn.responseParts.find(part => part.kind === ResponsePartKind.ToolCall && part.toolCall.toolCallId === spawn.parent?.toolCallId);
+		assert.ok(childLink?.kind === ResponsePartKind.ToolCall && childLink.toolCall.status === ToolCallStatus.Completed);
+		assert.strictEqual(childLink.toolCall.content?.find(content => content.type === ToolResultContentType.Subagent)?.resource, spawn.chat.toString());
+
+		const childHistory = restored.chats.getMessages(spawn.chat, {
+			...hostChatContext(live.session, spawn.chat),
+			origin: { kind: ChatOriginKind.Tool, chat: live.chat.toString(), toolCallId: spawn.parent.toolCallId },
+		});
+		await answerHistory(childThreadId, [turn('native-child-turn', [
+			request('seed', 'Edit the file'), reply('seed-reply', 'Edited'),
+			request('first', 'Check it'), reply('first-reply', 'First check'),
+			request('second', 'Check it'), reply('second-reply', 'Second check'),
+		])]);
+		assert.deepStrictEqual((await childHistory).map(turn => [turn.message.text, turn.responseParts.flatMap(part => part.kind === ResponsePartKind.Markdown ? [part.content] : [])]), [
+			['Edit the file', ['Edited']],
+			['Check it', ['First check']],
+			['Check it', ['Second check']],
+		]);
 	});
 
 	test('a replayed child edit keeps its arrival order before a sibling edit to the same file', async () => {

@@ -26,6 +26,7 @@ import {
 	type MessageResourceAttachment,
 	type ModelSelection,
 } from '../../common/state/sessionState.js';
+import type { ICodexSubagentBinding } from './codexSubagentBindingStore.js';
 import {
 	describeFileChange,
 	describeWebSearch,
@@ -76,19 +77,132 @@ export function replayThreadToTurns(
 	_threadCoordinationByTurnId?: ReadonlyMap<string, readonly ICodexThreadCoordinationCall[]>,
 	commands?: ICodexReplayedCommand[],
 ): Turn[] {
+	return replayCodexThreadToTurns(thread, false, modelsByTurnId, _threadCoordinationByTurnId, commands);
+}
+
+/**
+ * Reconstruct a native Codex child thread, splitting each native turn at
+ * delivered `userMessage` items. A child can receive follow-up work while a
+ * provider turn is still open; those messages are separate visible turns even
+ * though app-server keeps them in one item list.
+ *
+ * Root history keeps the existing one-turn-per-native-turn mapping.
+ */
+export function replayCodexSubagentThreadToTurns(
+	thread: Thread,
+	modelsByTurnId?: ReadonlyMap<string, ModelSelection>,
+	coordinationByTurnId?: ReadonlyMap<string, readonly ICodexThreadCoordinationCall[]>,
+	commands?: ICodexReplayedCommand[],
+): Turn[] {
+	return replayCodexThreadToTurns(thread, true, modelsByTurnId, coordinationByTurnId, commands);
+}
+
+function replayCodexThreadToTurns(
+	thread: Thread,
+	segmentSubagentTurns: boolean,
+	modelsByTurnId: ReadonlyMap<string, ModelSelection> | undefined,
+	coordinationByTurnId: ReadonlyMap<string, readonly ICodexThreadCoordinationCall[]> | undefined,
+	commands: ICodexReplayedCommand[] | undefined,
+): Turn[] {
 	const turns: Turn[] = [];
 	for (const codexTurn of thread.turns ?? []) {
-		const turn = replayTurnToTurn(
-			codexTurn,
-			modelsByTurnId?.get(codexTurn.id),
-			_threadCoordinationByTurnId?.get(codexTurn.id),
-			commands,
-		);
-		if (turn) {
-			turns.push(turn);
+		const segments = segmentSubagentTurns ? segmentTurnItems(codexTurn.items) : [codexTurn.items];
+		const nativeModel = modelsByTurnId?.get(codexTurn.id);
+		const nativeCoordination = coordinationByTurnId?.get(codexTurn.id);
+		for (const [index, items] of segments.entries()) {
+			const segmentId = index === 0 ? codexTurn.id : compositeSegmentId(codexTurn.id, items[0].id);
+			const isLast = index === segments.length - 1;
+			const segmentTurn: CodexTurn = segments.length === 1 ? { ...codexTurn, items } : {
+				...codexTurn,
+				items,
+				startedAt: index === 0 ? codexTurn.startedAt : null,
+				completedAt: null,
+				durationMs: null,
+				status: isLast ? codexTurn.status : 'completed',
+				error: isLast ? codexTurn.error : null,
+			};
+			const turn = replayTurnToTurn(
+				segmentTurn,
+				modelsByTurnId?.get(segmentId) ?? nativeModel,
+				index === 0 ? nativeCoordination : undefined,
+				commands,
+			);
+			if (turn) {
+				turn.id = segmentId;
+				turns.push(turn);
+			}
 		}
 	}
 	return turns;
+}
+
+/**
+ * Overlays durable Codex spawn bindings onto root replay. The host-side random
+ * tool-call id and the child chat URI come from the binding, so a restored
+ * parent never guesses them from an old transcript.
+ */
+export function overlayCodexSubagentBindings(
+	turns: Turn[],
+	thread: Thread,
+	bindings: readonly ICodexSubagentBinding[],
+	sourceChat: string,
+): void {
+	for (const binding of bindings) {
+		if (binding.parentChat !== sourceChat || binding.parentThreadId !== thread.id) {
+			continue;
+		}
+		const turn = turns.find(candidate => candidate.id === binding.parentTurnId);
+		if (!turn || turn.responseParts.some(part => part.kind === ResponsePartKind.ToolCall && part.toolCall.toolCallId === binding.toolCallId)) {
+			continue;
+		}
+		turn.responseParts.push({
+			kind: ResponsePartKind.ToolCall,
+			toolCall: {
+				status: ToolCallStatus.Completed,
+				toolCallId: binding.toolCallId,
+				toolName: 'codex.spawnAgent',
+				displayName: 'Spawn agent',
+				invocationMessage: 'Spawning agent',
+				confirmed: ToolCallConfirmationReason.NotNeeded,
+				success: true,
+				pastTenseMessage: 'Spawned agent',
+				_meta: toToolCallMeta({ toolKind: 'subagent' }),
+				content: [{
+					type: ToolResultContentType.Subagent,
+					resource: binding.childChat,
+					title: binding.title,
+					...(binding.model ? { agentName: binding.model.id } : {}),
+					...(binding.prompt ? { description: binding.prompt } : {}),
+				}],
+			},
+		});
+	}
+}
+
+/** Each distinct input starts a segment. Keep progress that predates the first input. */
+function segmentTurnItems(items: readonly ThreadItem[]): ThreadItem[][] {
+	const segments: ThreadItem[][] = [];
+	let current: ThreadItem[] = [];
+	const seenPrompts = new Set<string>();
+	for (const item of items) {
+		if (item.type === 'userMessage') {
+			if (seenPrompts.has(item.id)) {
+				continue;
+			}
+			seenPrompts.add(item.id);
+			if (current.length > 0) {
+				segments.push(current);
+				current = [];
+			}
+		}
+		current.push(item);
+	}
+	segments.push(current);
+	return segments;
+}
+
+function compositeSegmentId(turnId: string, itemId: string): string {
+	return `${turnId}/item:${itemId.length}:${itemId}`;
 }
 
 /** A completed `commandExecution` item narrowed to its terminal fields. */

@@ -39,8 +39,9 @@ import { toToolCallMeta } from '../../common/meta/agentToolCallMeta.js';
 import { AgentSdkSetupChannel } from '../agentSdkSetupChannel.js';
 import { CODEX_ACCOUNT_META_KEY, CODEX_ACCOUNT_REFRESH_REQUEST_KEY, CODEX_ACCOUNT_SIGN_IN_REQUEST_KEY, CODEX_ACCOUNT_SIGN_OUT_REQUEST_KEY, type ICodexAccountInfo } from '../../common/codexAccount.js';
 import { getReasoningEffortDescription, getReasoningEffortLabel, resolveDefaultReasoningEffort } from '../../common/reasoningEffort.js';
-import { AgentChatMigrationDeferred, type AgentChatMigrationResult, AgentSession, fixedChatOwnerRef, resolveSessionBackedStorage, type IAgentChatOwnerRef, AgentSignal, AgentWorkingDirectoryChangedError, CODEX_AGENT_PROVIDER_ID, IActiveClient, IAgent, IAgentChatConfigCompletionsParams, IAgentChatContext, IAgentChatDataChange, IAgentChatHistoryChange, IAgentChatMetadata, type IAgentChatMetadataOptions, IAgentChats, IAgentCreateChatForkSource, IAgentCreateChatResult, IAgentCreateChatOptions, IAgentDescriptor, IAgentDiscoveredChat, IAgentListedChat, IAgentMaterializeChatEvent, IAgentModelInfo, type IAgentPrepareChatResult, IAgentResolveChatConfigParams, IAgentSpawnChatEvent, IMcpNotification, resolveAgentChatContext, resolveAgentHostInstructions, type AgentProvider, type AuthenticateParams } from '../../common/agent.js';
+import { AgentChatMigrationDeferred, type AgentChatMigrationResult, AgentSession, fixedChatOwnerRef, resolveSessionBackedStorage, type IAgentChatOwnerRef, AgentSignal, AgentWorkingDirectoryChangedError, CODEX_AGENT_PROVIDER_ID, IActiveClient, IAgent, IAgentChatConfigCompletionsParams, IAgentChatContext, IAgentChatDataChange, IAgentChatHistoryChange, IAgentChatMetadata, type IAgentChatMetadataOptions, IAgentChats, IAgentCreateChatForkSource, IAgentCreateChatResult, IAgentCreateChatOptions, IAgentDescriptor, IAgentDiscoveredChat, IAgentListedChat, IAgentMaterializeChatEvent, IAgentModelInfo, type IAgentPrepareChatResult, IAgentResolveChatConfigParams, IAgentSpawnChatEvent, IMcpNotification, resolveAgentChatContext, resolveAgentHostInstructions, resolveSubagentChatParent, subagentChatTitle, type IAgentSpawnedChatParent, type AgentProvider, type AuthenticateParams } from '../../common/agent.js';
 import { AgentHostCodexAgentBinaryArgsEnvVar, AgentHostCodexAgentCodexHomeEnvVar, AgentHostCodexTurnEditsWaitMsEnvVar } from '../../common/agentService.js';
+import { subagentChatUri } from '../../common/agentHostChatMinting.js';
 import { SessionConfigKey } from '../../common/sessionConfigKeys.js';
 import { AHP_AUTH_REQUIRED, ProtocolError } from '../../common/state/sessionProtocol.js';
 import { ActionType, isChatAction, type SessionAction, type ChatAction } from '../../common/state/sessionActions.js';
@@ -103,7 +104,7 @@ import { unwrapShellInvocation } from './codexShellCommand.js';
 import { planForkedTurnIdMap, resolveForkBoundary } from './codexForkPlan.js';
 import { resolveCodexInput } from './codexPromptResolver.js';
 import { buildUserInputRequest, emptyUserInputResponse, userInputResponseFromAnswers } from './codexUserInputMapper.js';
-import { replayThreadToTurns, type ICodexReplayedCommand } from './codexReplayMapper.js';
+import { overlayCodexSubagentBindings, replayCodexSubagentThreadToTurns, replayThreadToTurns, type ICodexReplayedCommand } from './codexReplayMapper.js';
 import { codexRetainedCommandOutputContent, shouldRetainCodexCommandOutput } from './codexTerminalOutput.js';
 import { storeCodexTurnDiffs } from './codexTurnDiff.js';
 import { CodexTurnDiffTracker } from './codexTurnDiffTracker.js';
@@ -111,6 +112,7 @@ import type { TurnDiffUpdatedNotification } from './protocol/generated/v2/TurnDi
 import { buildNonPtyShellTerminalUri } from '../../common/nonPtyShellTerminalUri.js';
 import { VSBuffer } from '../../../../base/common/buffer.js';
 import { CodexSessionMetadataStore } from './codexSessionMetadataStore.js';
+import { CodexSubagentBindingStore, type ICodexSubagentBinding } from './codexSubagentBindingStore.js';
 import { buildCodexLaunchConfig, buildCodexResumeParams, codexPermissionProfile, codexPermissionProfileReadRoots, codexServiceTierOverride, CODEX_DEFAULT_MODE_REQUEST_USER_INPUT_CONFIG_KEY } from './codexLaunchConfig.js';
 import { codexDelegationDisplayText } from './codexDelegation.js';
 import { THREAD_LIST_MAX_PAGES, collectThreadListPages } from './codexThreadList.js';
@@ -1230,6 +1232,7 @@ export class CodexAgent extends Disposable implements IAgent {
 	 * parent runtime or connection.
 	 */
 	private readonly _subagentsByThreadId = new Map<string, ICodexSubagent>();
+	/** Reverse lookup from the bound child chat to its native child thread. */
 	/**
 	 * `spawnAgent` calls that started but have not completed, keyed by calling
 	 * thread and item id, with the session that made each call. Codex starts a
@@ -1337,6 +1340,7 @@ export class CodexAgent extends Disposable implements IAgent {
 	private _copilotModels: readonly IAgentModelInfo[] = [];
 	private _codexModels: readonly IAgentModelInfo[] = [];
 	private readonly _metadataStore: CodexSessionMetadataStore;
+	private readonly _subagentBindingStore: CodexSubagentBindingStore;
 	private _lastSignInRequest: string | undefined;
 	private _lastSignOutRequest: string | undefined;
 	private readonly _worktree: IAgentHostWorktreePendingState;
@@ -1375,6 +1379,7 @@ export class CodexAgent extends Disposable implements IAgent {
 		super();
 		this._worktree = worktree;
 		this._metadataStore = this._instantiationService.createInstance(CodexSessionMetadataStore);
+		this._subagentBindingStore = this._instantiationService.createInstance(CodexSubagentBindingStore);
 		this._githubMcpServerEnabled = this._isGitHubMcpServerEnabled();
 		this._publishAccountInfo({ status: 'unknown' });
 		if (isAgentHostTelemetryService(this._telemetryService)) {
@@ -3565,6 +3570,14 @@ export class CodexAgent extends Disposable implements IAgent {
 		});
 	}
 
+	private async _persistSubagentBinding(storage: URI, binding: ICodexSubagentBinding): Promise<void> {
+		try {
+			await this._subagentBindingStore.write(storage, binding);
+		} catch (error) {
+			this._logService.warn(`[Codex] Failed to persist subagent binding for ${binding.childThreadId}`, error);
+		}
+	}
+
 	/**
 	 * Correlates echoes by submission ID, falling back to resolved input text for older servers.
 	 */
@@ -4197,6 +4210,7 @@ export class CodexAgent extends Disposable implements IAgent {
 			return;
 		}
 		const parentChat = session.chatChannel!;
+		const spawningChild = session.threadId ? this._subagentsByThreadId.get(session.threadId) : undefined;
 		const model = item.model || undefined;
 		const taskDescription = item.prompt || undefined;
 		for (const childThreadId of item.receiverThreadIds) {
@@ -4204,7 +4218,6 @@ export class CodexAgent extends Disposable implements IAgent {
 				continue;
 			}
 			const subSession = this._createSubagentSession(session, childThreadId, model);
-			const spawningChild = session.threadId ? this._subagentsByThreadId.get(session.threadId) : undefined;
 			const hostTurnId = spawningChild?.hostTurnId ?? this._hostTurnId(session, params.turnId);
 			const owner = this._turnDiffOwner(session) ?? session;
 			this._getTurnDiffTracker(owner).trackChild(childThreadId, hostTurnId);
@@ -4220,6 +4233,23 @@ export class CodexAgent extends Disposable implements IAgent {
 				pendingEvents: [],
 				session: subSession,
 			});
+			if (session.chatStorage) {
+				const owner = session.owner.get();
+				const format = session.owner.getSubagentChatUriFormat();
+				const subagentChat = subagentChatUri(format, owner.toString(), parentChat.toString(), entry.toolCallId);
+				const title = subagentChatTitle(taskDescription, model ?? 'Subagent');
+				void this._persistSubagentBinding(owner, {
+					title,
+					parentChat: parentChat.toString(),
+					childChat: subagentChat,
+					toolCallId: entry.toolCallId,
+					childThreadId,
+					parentThreadId: params.threadId,
+					parentTurnId: params.turnId,
+					...(item.prompt ? { prompt: item.prompt } : {}),
+					...(model ? { model: subSession.model } : {}),
+				});
+			}
 			this._emitChatProgress(session, {
 				kind: 'subagent_started',
 				chat: parentChat,
@@ -7407,6 +7437,10 @@ export class CodexAgent extends Disposable implements IAgent {
 	 */
 	private async _getChatMessages(chat: URI, context: URI | IAgentChatContext): Promise<readonly Turn[]> {
 		const operationContext = resolveAgentChatContext(context, chat);
+		const subagentParent = resolveSubagentChatParent(operationContext);
+		if (subagentParent) {
+			return this._getSubagentChatMessages(chat, operationContext, subagentParent);
+		}
 		const sessionUri = this._resolveConversationSession(chat, operationContext);
 		if (!sessionUri) {
 			return [];
@@ -7417,6 +7451,7 @@ export class CodexAgent extends Disposable implements IAgent {
 		}
 		const commands: ICodexReplayedCommand[] = [];
 		const turns = replayThreadToTurns(read.thread, toRolloutTurnModels(read.rolloutMetadata), read.rolloutMetadata?.threadCoordinationByTurnId, commands);
+		overlayCodexSubagentBindings(turns, read.thread, await this._subagentBindingStore.readAll(operationContext.owner.get()), chat.toString());
 		await this._restoreRetainedCommandOutputs(operationContext.resource, operationContext.owner.get(), chat, commands);
 		const session = this._sessions.get(AgentSession.id(sessionUri));
 		if (session) {
@@ -7426,6 +7461,22 @@ export class CodexAgent extends Disposable implements IAgent {
 			}
 		}
 		return turns;
+	}
+
+	/** Replays a tool-spawned child from its exact persisted binding, never from a legacy random tool id. */
+	private async _getSubagentChatMessages(chat: URI, context: IAgentChatContext, parent: IAgentSpawnedChatParent): Promise<readonly Turn[]> {
+		const binding = await this._subagentBindingStore.read(context.owner.get(), chat.toString());
+		if (!binding || binding.parentChat !== parent.chat.toString() || binding.toolCallId !== parent.toolCallId) {
+			return [];
+		}
+		const read = await this._readSession(AgentSession.uri(this.id, binding.childThreadId));
+		if (!read) {
+			return [];
+		}
+		if (read.thread.id !== binding.childThreadId || (read.thread.parentThreadId && read.thread.parentThreadId !== binding.parentThreadId)) {
+			return [];
+		}
+		return replayCodexSubagentThreadToTurns(read.thread, toRolloutTurnModels(read.rolloutMetadata), read.rolloutMetadata?.threadCoordinationByTurnId);
 	}
 
 	/**
@@ -7502,7 +7553,11 @@ export class CodexAgent extends Disposable implements IAgent {
 		const rolloutMetadata = this._chatHistoryRolloutMetadata.get(session);
 		const changed = read.thread.turns.filter(turn => !hostTurnIds.has(turn.id) && !equals(previousRaw.get(turn.id), turn));
 		const commands: ICodexReplayedCommand[] = [];
-		const changedTurns = replayThreadToTurns({ ...read.thread, turns: changed }, toRolloutTurnModels(rolloutMetadata), rolloutMetadata?.threadCoordinationByTurnId, commands);
+		const changedThread = { ...read.thread, turns: changed };
+		const changedTurns = replayThreadToTurns(changedThread, toRolloutTurnModels(rolloutMetadata), rolloutMetadata?.threadCoordinationByTurnId, commands);
+		if (changed.length > 0) {
+			overlayCodexSubagentBindings(changedTurns, changedThread, await this._subagentBindingStore.readAll(session.owner.get()), chat.toString());
+		}
 		if (session.chatStorage) {
 			await this._restoreRetainedCommandOutputs(session.chatStorage, session.owner.get(), chat, commands);
 		}

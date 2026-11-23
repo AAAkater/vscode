@@ -21,7 +21,7 @@ import { ContentEncoding } from '../../../common/state/protocol/common/commands.
 import type { ResourceReadResult, SubscribeResult } from '../../../common/state/protocol/commands.js';
 import { PROTOCOL_VERSION } from '../../../common/state/protocol/version/registry.js';
 import { ActionType } from '../../../common/state/sessionActions.js';
-import { getToolFileEdits, MessageKind, PendingMessageKind, ResponsePartKind, ROOT_STATE_URI, type ChangesetState, type ChatState, type ISessionFileDiff } from '../../../common/state/sessionState.js';
+import { getToolFileEdits, getToolSubagentContent, MessageKind, PendingMessageKind, ResponsePartKind, ROOT_STATE_URI, ToolCallStatus, type ChangesetState, type ChatState, type ISessionFileDiff, type SessionState } from '../../../common/state/sessionState.js';
 import { CODEX_SDK_ROOT } from '../e2e/providers/codexTestConfiguration.js';
 import { preserveAgentHostE2ELogs } from '../e2e/harness/agentHostE2EDiagnostics.js';
 import { dispatchTurn } from '../providerIntegrationTestHelpers.js';
@@ -679,6 +679,73 @@ suite('Agent Host Provider Integration — Codex Turn Diffs', function () {
 			second: [{ before: { path: 'edit.txt', content: 'b\n' }, after: { path: 'edit.txt', content: 'c\n' } }],
 			session: [{ before: { path: 'edit.txt', content: 'a\n' }, after: { path: 'edit.txt', content: 'c\n' } }],
 		});
+	});
+
+	test('a reused child keeps its original chat and ordered follow-ups after a cold host restart', async () => {
+		const firstPrompt = '[scenario:codex-cold-reopen-first] Reply with the first child response.';
+		const secondPrompt = '[scenario:codex-cold-reopen-second] Reply with the second child response.';
+		const thirdPrompt = '[scenario:codex-cold-reopen-third] Reply with the third child response.';
+		const firstResponse = 'hello from the first child turn';
+		const secondResponse = 'hello from the second child turn';
+		const thirdResponse = 'hello from the third child turn';
+		const followUp = (id: string, message: string) => ({
+			id, definition: { type: 'multi-turn' as const, turns: [
+				{ kind: 'tool-calls' as const, toolCalls: [{ toolNamePattern: /^send_input$/, namespace: 'multi_agent_v1', arguments: (request: readonly any[]) => ({ target: spawnedChildId(request), message }) }] },
+				{ kind: 'tool-calls' as const, toolCalls: [waitForChild] },
+				{ kind: 'content' as const, chunks: [{ content: 'Parent finished the follow-up.', delayMs: 0 }] },
+			] },
+		});
+		await start({}, {}, {
+			extraScenarios: [
+				...[['first', firstResponse], ['second', secondResponse], ['third', thirdResponse]].map(([id, content]) => ({
+					id: `codex-cold-reopen-${id}`, definition: { type: 'multi-turn' as const, turns: [{ kind: 'content' as const, chunks: [{ content, delayMs: 0 }] }] },
+				})),
+				{ id: 'codex-cold-reopen-spawn', definition: { type: 'multi-turn', turns: [
+					{ kind: 'tool-calls', toolCalls: [{ toolNamePattern: /^spawn_agent$/, namespace: 'multi_agent_v1', arguments: { agent_type: 'default', message: firstPrompt } }] },
+					{ kind: 'tool-calls', toolCalls: [waitForChild] },
+					{ kind: 'content', chunks: [{ content: 'Parent finished the spawn.', delayMs: 0 }] },
+				] } },
+				followUp('codex-cold-reopen-send-first', secondPrompt),
+				followUp('codex-cold-reopen-send-second', thirdPrompt),
+			],
+		});
+		const parentTurn = await runTurn('codex-cold-reopen-spawn');
+		const liveState = (await client.call<SubscribeResult>('subscribe', { channel: defaultChatChannel(session) })).snapshot!.state as ChatState;
+		const spawn = liveState.turns.find(turn => turn.id === parentTurn)?.responseParts.find(part => part.kind === ResponsePartKind.ToolCall && part.toolCall.status === ToolCallStatus.Completed && getToolSubagentContent(part.toolCall));
+		assert.ok(spawn?.kind === ResponsePartKind.ToolCall && spawn.toolCall.status === ToolCallStatus.Completed, 'the parent turn should expose the completed spawn_agent tool call');
+		const child = getToolSubagentContent(spawn.toolCall);
+		assert.ok(child, 'the spawn_agent result should expose the child chat URI');
+		const childUri = child.resource.toString();
+		const spawnToolCallId = spawn.toolCall.toolCallId;
+		const readChildTurns = async () => ((await client.call<SubscribeResult>('subscribe', { channel: childUri })).snapshot!.state as ChatState).turns.map(turn => ({
+			message: turn.message.text,
+			response: turn.responseParts.flatMap(part => part.kind === ResponsePartKind.Markdown ? [part.content] : []).join(''),
+		}));
+		const expectedChildTurns = [
+			{ message: firstPrompt, response: firstResponse },
+			{ message: secondPrompt, response: secondResponse },
+			{ message: thirdPrompt, response: thirdResponse },
+		];
+
+		await runTurn('codex-cold-reopen-send-first');
+		await runTurn('codex-cold-reopen-send-second');
+		assert.deepStrictEqual(await readChildTurns(), expectedChildTurns);
+
+		client.close();
+		await stopServer(server);
+		server = await startRealServer(options);
+		client = new TestProtocolClient(server.port);
+		await client.connect();
+		await client.call('initialize', { channel: ROOT_STATE_URI, protocolVersions: [PROTOCOL_VERSION], clientId: 'codex-turn-diff-reopened' }, 30_000);
+		await client.call('authenticate', { channel: ROOT_STATE_URI, resource: 'https://api.github.com', token: 'not-a-real-token' }, 30_000);
+		const reopenedSession = await client.call<SubscribeResult>('subscribe', { channel: session });
+		const reopenedParent = (await client.call<SubscribeResult>('subscribe', { channel: defaultChatChannel(session) })).snapshot!.state as ChatState;
+		const reopenedSpawn = reopenedParent.turns.flatMap(turn => turn.responseParts).find(part => part.kind === ResponsePartKind.ToolCall && part.toolCall.toolCallId === spawnToolCallId);
+		assert.ok(reopenedSpawn?.kind === ResponsePartKind.ToolCall && reopenedSpawn.toolCall.status === ToolCallStatus.Completed, 'the restored parent should contain the original spawn tool call');
+		assert.strictEqual(getToolSubagentContent(reopenedSpawn.toolCall)?.resource, childUri);
+		const reopenedSessionState = reopenedSession.snapshot!.state as SessionState;
+		assert.ok(reopenedSessionState.chats.some(chat => chat.resource.toString() === childUri), 'the parent catalog should retain the child chat after the cold restart');
+		assert.deepStrictEqual(await readChildTurns(), expectedChildTurns);
 	});
 
 	test('a child that finishes before its parent edits the same file keeps its edit in the turn', async () => {
